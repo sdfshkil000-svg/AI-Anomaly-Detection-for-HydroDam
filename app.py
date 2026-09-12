@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import streamlit as st
+from groq import Groq
 
 # ============================================================
 # HydroSafe AI - Member 4: Anomaly Detection Agent
@@ -198,6 +199,116 @@ def detect_anomalies(readings) -> list[dict]:
 
 
 # -----------------------------
+# Groq AI interpretation
+# -----------------------------
+GROQ_MODEL = "openai/gpt-oss-20b"
+
+
+def _get_groq_client():
+    """Create a Groq client from Streamlit Secrets.
+
+    The API key is intentionally NOT stored in this source file.
+    Configure it in Streamlit Cloud Secrets as:
+        GROQ_API_KEY = "your-key"
+    """
+    try:
+        api_key = st.secrets["GROQ_API_KEY"]
+    except Exception:
+        return None
+
+    if not api_key:
+        return None
+
+    return Groq(api_key=api_key)
+
+
+def _build_ai_context(top_result: dict, sensor_history: pd.DataFrame) -> dict:
+    """Prepare compact sensor context for the AI model."""
+    history = sensor_history.copy()
+    history["timestamp"] = pd.to_datetime(history["timestamp"], errors="coerce")
+    history = history.dropna(subset=["value"])
+
+    recent = history.tail(20)
+
+    return {
+        "sensor": top_result["sensor"],
+        "baseline": top_result["baseline"],
+        "current_value": top_result["current_value"],
+        "deviation": top_result["deviation"],
+        "anomaly_score": top_result["score"],
+        "severity": top_result["severity"],
+        "confidence": top_result["confidence"],
+        "recent_readings": [
+            round(float(v), 4) for v in recent["value"].tolist()
+        ],
+        "history_count": int(len(history)),
+    }
+
+
+def get_ai_interpretation(top_result: dict, sensor_history: pd.DataFrame) -> str:
+    """Ask Groq to interpret an already-detected anomaly.
+
+    The numerical anomaly score/severity comes from the deterministic
+    anomaly engine. Groq only explains the result and suggests verification
+    steps; it does not determine the safety state.
+    """
+    client = _get_groq_client()
+
+    if client is None:
+        return (
+            "Groq is not configured. Add GROQ_API_KEY to Streamlit Secrets "
+            "to enable AI interpretation."
+        )
+
+    context = _build_ai_context(top_result, sensor_history)
+
+    system_prompt = """
+You are HydroSafe AI, a dam-monitoring decision-support assistant.
+
+Interpret an anomaly that has ALREADY been detected by a deterministic
+numerical anomaly engine.
+
+Rules:
+1. Never change the supplied severity, anomaly score, confidence, baseline,
+   or current value.
+2. Do not claim that a dam is unsafe or failing from this result alone.
+3. Separate observed evidence from possible explanations.
+4. Recommend practical engineering verification steps.
+5. Be concise and technically professional.
+6. This is decision support, not a replacement for engineering judgement
+   or field verification.
+
+Return exactly these sections:
+### Interpretation
+### Possible causes
+### Recommended verification
+### Engineering note
+"""
+
+    user_prompt = (
+        "Interpret this HydroSafe anomaly result.\n\n"
+        + json.dumps(context, indent=2)
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_completion_tokens=700,
+        )
+
+        content = response.choices[0].message.content
+        return content.strip() if content else "Groq returned an empty response."
+
+    except Exception as exc:
+        return f"Groq AI interpretation could not be generated. API error: {exc}"
+
+
+# -----------------------------
 # Demo data for the Streamlit UI
 # -----------------------------
 @st.cache_data
@@ -253,8 +364,9 @@ st.set_page_config(
 st.title("💧 HydroSafe AI")
 st.subheader("Member 4 — AI Anomaly Detection Agent")
 st.caption(
-    "Prototype: detects abnormal dam-monitoring sensor behaviour from historical "
-    "and latest readings. The anomaly engine is deterministic and explainable."
+    "Prototype: deterministic anomaly detection plus Groq AI interpretation for "
+    "dam-monitoring sensor behaviour. The AI explains detected anomalies but "
+    "does not determine the numerical risk state."
 )
 
 with st.sidebar:
@@ -274,6 +386,15 @@ with st.sidebar:
     )
 
     use_demo = st.checkbox("Use HydroSafe demo data", value=uploaded is None)
+
+    st.divider()
+    st.markdown("### AI interpretation")
+    if _get_groq_client() is not None:
+        st.success("Groq API connected")
+        st.caption(f"Model: `{GROQ_MODEL}`")
+    else:
+        st.warning("Groq API not configured")
+        st.caption("Add GROQ_API_KEY in Streamlit Secrets.")
 
 if uploaded is not None:
     try:
@@ -374,6 +495,17 @@ selected_result = next(
 
 st.json(selected_result)
 
+st.markdown("### 🤖 Groq AI interpretation")
+st.caption(
+    "Groq explains the detected anomaly and suggests verification steps. "
+    "It does not calculate or override the numerical risk state."
+)
+
+if st.button("Analyze selected sensor with Groq", type="primary"):
+    with st.spinner("Groq is interpreting the anomaly..."):
+        ai_text = get_ai_interpretation(selected_result, sensor_history)
+    st.markdown(ai_text)
+
 st.markdown("### Unified `anomalies` output")
 
 st.code(
@@ -382,6 +514,7 @@ st.code(
 )
 
 st.caption(
+    "API-key safety: GROQ_API_KEY must be stored in Streamlit Secrets and never committed to GitHub. "
     "Safety note: this prototype is decision support only. An anomaly flag should "
     "be verified against instrument condition, data quality, thresholds, and "
     "engineering judgement."
